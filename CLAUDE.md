@@ -131,10 +131,21 @@ first, and if the API really changed, update the assertion and this file
 together.
 
 For live verification, `.env` holds a real `DINGCONNECT_API_KEY` and is
-gitignored. Read-only commands (`balance`, `products`, `providers`, `lookup`)
-are safe to run against production. `send` without `--confirm` is also safe.
-Note the account balance may be **$0.00**, in which case every real transfer
-returns `InsufficientBalance` no matter how correct the request is — check
+gitignored. The CLI does **not** read it: configuration comes from the
+environment, matching every other service in this org, so load it explicitly.
+
+```sh
+denv .env dingconnect balance
+```
+
+Do not add an implicit `.env` lookup back. Any such lookup is cwd-relative, so
+which key a transfer used would depend on where the command was run from, and a
+stray `.env` in an unrelated directory would silently take over.
+
+Read-only commands (`balance`, `products`, `providers`, `lookup`) are safe to
+run against production. `send` without `--confirm` is also safe. Note the
+account balance may be **$0.00**, in which case every real transfer returns
+`InsufficientBalance` no matter how correct the request is — check
 `dingconnect balance` before concluding a transfer bug exists.
 
 ## Relationship to fly

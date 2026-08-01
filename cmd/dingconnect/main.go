@@ -3,12 +3,15 @@
 // Every subcommand prints a human-readable table by default and raw JSON with
 // --json, so it composes with jq.
 //
-// The API key is read from DINGCONNECT_API_KEY, from a .env file in the working
-// directory, or from --api-key.
+// The API key is read from DINGCONNECT_API_KEY or from --api-key. Nothing is
+// loaded from disk: like every other service in this org, configuration comes
+// from the environment, and putting a file there is the caller's job --
+// `denv .env dingconnect balance`. An implicit .env lookup would be
+// cwd-dependent, so which key a transfer used would depend on where the
+// command was run from.
 package main
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -54,9 +57,14 @@ Reference:
   error-codes             List DingConnect error codes and their meanings
 
 Global flags:
-  --api-key string        API key (default $DINGCONNECT_API_KEY, or .env)
+  --api-key string        API key (default $DINGCONNECT_API_KEY)
   --json                  Emit raw JSON instead of a table
   --timeout duration      Request timeout (default 90s)
+
+The API key comes from the environment. To load it from a file for a single
+command, use denv:
+
+  denv .env dingconnect balance
 
 Run "dingconnect <command> --help" for the flags of a single command.
 `
@@ -87,42 +95,13 @@ func (g *globals) client() (*dingconnect.Client, error) {
 		key = os.Getenv("DINGCONNECT_API_KEY")
 	}
 	if key == "" {
-		key = keyFromDotEnv(".env")
-	}
-	if key == "" {
-		return nil, errors.New("no API key: set DINGCONNECT_API_KEY, add it to .env, or pass --api-key")
+		return nil, errors.New("no API key: export DINGCONNECT_API_KEY, pass --api-key, or run via `denv .env dingconnect ...`")
 	}
 	timeout := g.timeout
 	if timeout <= 0 {
 		timeout = dingconnect.DefaultTimeout
 	}
 	return dingconnect.New(key, dingconnect.WithHTTPClient(&http.Client{Timeout: timeout})), nil
-}
-
-// keyFromDotEnv reads DINGCONNECT_API_KEY out of a .env file. Missing or
-// unreadable files are not an error -- the key may legitimately come from the
-// environment instead.
-func keyFromDotEnv(path string) string {
-	f, err := os.Open(path)
-	if err != nil {
-		return ""
-	}
-	defer f.Close()
-
-	sc := bufio.NewScanner(f)
-	for sc.Scan() {
-		line := strings.TrimSpace(sc.Text())
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		line = strings.TrimPrefix(line, "export ")
-		k, v, ok := strings.Cut(line, "=")
-		if !ok || strings.TrimSpace(k) != "DINGCONNECT_API_KEY" {
-			continue
-		}
-		return strings.Trim(strings.TrimSpace(v), `"'`)
-	}
-	return ""
 }
 
 type command struct {

@@ -25,8 +25,14 @@ go install github.com/vlab-research/go-dingconnect/cmd/dingconnect@latest   # CL
 
 ## CLI
 
-The API key is read from `DINGCONNECT_API_KEY`, a `.env` file in the working
-directory, or `--api-key`.
+The API key is read from `DINGCONNECT_API_KEY` or `--api-key`. Nothing is
+loaded from disk — configuration comes from the environment, as it does in
+every other service in this org. To load a file for a single command, use
+`denv`:
+
+```sh
+denv .env dingconnect balance
+```
 
 ```sh
 dingconnect balance
