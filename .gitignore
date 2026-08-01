@@ -1,0 +1,8 @@
+# Built binaries. These patterns are anchored with a leading slash on purpose:
+# a bare "dingconnect" would also match the cmd/dingconnect/ source directory
+# and silently exclude the CLI from the repo.
+/dingconnect
+/cmd/dingconnect/dingconnect
+
+.env
+coverage.out
