@@ -67,6 +67,57 @@ thing making a `SendTransfer` retry safe.
 turns a transient failure into a double payment. The CLI refuses to invent a
 ref for this reason.
 
+### Unverified: what `RechargeNotAllowed` actually means
+
+`Pay`'s discovery path advances to the next candidate on `RechargeNotAllowed`,
+treating it as "wrong operator for this account number". **This is inferred, not
+confirmed.** DingConnect documents the code against "product/send amount", not
+explicitly against an operator mismatch; the phrasing fits and no better
+candidate exists, but nobody has watched it come back from a deliberately
+wrong-operator send.
+
+The design is built so that being wrong is survivable: `RechargeNotAllowed` is
+only the *advance* signal, and advancing is an allow-list. If it turns out to
+mean something else, discovery degrades into a single attempt and every other
+path is untouched. Nothing sends money somewhere it should not.
+
+**To confirm:** `SendTransfer` with `ValidateOnly: true`, a known-good account
+number, and a SKU belonging to a different operator in the same country.
+`ValidateOnly` runs the full validation without moving money or assigning a
+TransferId, and `Product.UatNumber` supplies the known-good half. If the
+wrong-operator SKU comes back `RechargeNotAllowed`, this is settled — update
+this section and `decideCascade`'s comment together.
+
+### Unverified: `DistributorRef` length and charset
+
+`MaxDistributorRefLen` is **64, and that number is a guess.** DingConnect
+documents no limit, and none has been observed. It matters because `Pay` derives
+a per-candidate ref (`<ref>_<SkuCode>`) on the discovery path, which is longer
+than what the caller supplied.
+
+It is enforced up front, before any money moves, rather than by truncating: a
+truncated ref is unsearchable in `ListTransferRecords`, which is exactly when
+you need it. Raising the constant is cheap once someone can ask DingConnect or
+watch a long ref be rejected.
+
+Related and also unverified: **whether a rejected transfer consumes its
+`DistributorRef`.** `Pay` derives a distinct ref per candidate specifically so
+this does not have to be known — if refs are not consumed the derived ones are
+merely more unique than they needed to be, whereas a single shared ref would
+make every discovery cascade fail at its second candidate with
+`DuplicateTransactionPrevented` if they are. To confirm: submit a transfer that
+fails without moving money (a deliberately invalid account number), then reuse
+that exact ref for a valid transfer and see whether it is refused.
+
+### Range products are assumed to be priced linearly
+
+`Product` exposes only `Minimum` and `Maximum`, so `Pay` interpolates linearly
+between them to answer "what does this deliver at this send value". This is
+implied by `CommissionRate` being a single per-product number, but it is not
+documented. Fixed products interpolate nothing and are unaffected.
+`EstimatePrices` prices a prospective transfer exactly and is the way to check a
+range product before trusting a tight tolerance against it.
+
 ### Endpoint quirks
 
 - `EstimatePrices` takes a **bare JSON array** as its body, not an object
@@ -105,6 +156,12 @@ error is non-nil.
 cannot pass unnoticed; callers opt in with `IsNearestMatch`. This is the
 "fail fast and loud" rule applied to a case the API makes easy to ignore.
 
+**No metrics registry, no logger.** `Pay` returns a `Resolution` describing what
+it did -- which path, which operator, which product, every attempt -- and the
+caller records it however it likes. A library that reaches for a metrics client
+forces its choice of one on every consumer, and a library that logs decides
+where a consumer's output goes. Hand back the facts instead.
+
 **The CLI never spends money by accident.** `send` defaults to
 `ValidateOnly` and requires an explicit `--confirm`. Keep it that way.
 
@@ -115,9 +172,17 @@ client.go    Client, options, the generic do[T] helper, query building
 errors.go    Status, Error, result/error code constants, Is* helpers
 types.go     Request and response types — mirrors of the wire format
 api.go       One method per endpoint, thin wrappers over do[T]
+payment.go   Pay: resolving a top-up by delivered amount rather than by SKU
 client_test.go            Contract tests against an httptest stub
+payment_test.go           Pay's resolution, verification and cascade tests
 cmd/dingconnect/main.go   The CLI
 ```
+
+`payment.go` is the one file that is not a thin wrapper over an endpoint. It
+composes `GetAccountLookup`, `GetProducts` and `SendTransfer` into a single
+operation, and it is where amount selection and the advance/stop policy live.
+That policy is error-code semantics, which is this package's job by the rule
+below.
 
 ## Testing
 
@@ -150,11 +215,25 @@ account balance may be **$0.00**, in which case every real transfer returns
 
 ## Relationship to fly
 
-`fly/dinersclub` consumes this package as its DingConnect provider. The
-provider there should be a thin adapter: map `PaymentEvent` details to
-`SendTransferRequest`, call `SendTransfer`, map the result back to a
-`dinersclub.Result`. All HTTP, error classification, and wire-format knowledge
-belongs here, not there.
+`fly/dinersclub` consumes this package as its DingConnect provider. The provider
+there is a thin adapter: unmarshal its own payment config, call `Pay` (or
+`SendTransfer` when a caller named a product explicitly), map the outcome back
+to a `dinersclub.Result`, and record the returned `Resolution` as metrics.
+
+**All HTTP, error classification, amount selection, and wire-format knowledge
+belongs here, not there.** That line was already the rule and was briefly
+crossed: an earlier version of the amount-resolution work lived entirely in
+`dinersclub`, which put cascade error-code semantics in a consumer. It moved
+here, which is what `payment.go` is.
+
+The split, stated so the next person does not have to re-derive it:
+
+| here | there |
+|---|---|
+| operator detection, catalogue fetch and caching | unmarshalling the consumer's own config format |
+| amount selection, pin verification | credentials and secret storage |
+| the advance/stop cascade policy | mapping outcomes onto the consumer's result type |
+| `DistributorRef` derivation (idempotency is a wire property) | recovery classification, retry policy, metrics |
 
 When changing anything in the wire contract above, check whether
 `fly/dinersclub` needs the same change.
