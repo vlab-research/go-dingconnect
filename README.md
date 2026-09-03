@@ -107,6 +107,102 @@ res, err := c.SendTransfer(ctx, dingconnect.SendTransferRequest{
 })
 ```
 
+### Paying by delivered amount
+
+`SendTransfer` takes a `SkuCode` and a `SendValue`. Both are per-operator: a SKU
+belongs to one network, and the send value that delivers a given local amount
+differs between networks because commission rates differ. Three products can all
+deliver ARS 1,000 while costing 0.79, 0.85 and 0.93 USD.
+
+That makes a bare `SendValue` an uninterpretable number. Nothing records what it
+was *for*, so nothing can check it — and when a commission rate moves, the old
+value is still a perfectly valid request. The transfer completes, `ResultCode`
+is 1, and the recipient quietly gets less than you intended.
+
+`Pay` closes that hole. You declare what you want delivered, and optionally pin
+the products you believe satisfy it:
+
+```go
+res, err := c.Pay(ctx, dingconnect.PayRequest{
+    AccountNumber:  "5491112345678",
+    DistributorRef: "order-123",
+
+    Amount:         1000,     // MINIMUM DELIVERED, not a cap on spend
+    AmountCurrency: "ARS",    // validated against the product's ReceiveCurrencyIso
+    Tolerance:      200,      // headroom on the delivered amount
+
+    Operators: map[string]dingconnect.OperatorPin{
+        "CLAR": {SkuCode: "CLAR5046",  SendValue: 0.79},
+        "TFAR": {SkuCode: "TFAR58291", SendValue: 0.85},
+        "PRAR": {SkuCode: "PRAR13725", SendValue: 0.93},
+    },
+})
+```
+
+The declared amount is what makes the pinned value verifiable — that is the
+whole reason for carrying both. `Operators` is optional; without it `Pay`
+resolves the cheapest in-window product from the live catalogue.
+
+How a payment resolves:
+
+1. **Operator known** (from `Operator`, or looked up from the account number)
+   **and pinned** — verify the pin against the window, send. One transfer.
+2. **Operator known, pins given, none for it** — `ReasonNoPinForOperator`.
+3. **Operator known, no pins** — cheapest in-window product from the catalogue.
+4. **Operator not determined, pins given** — try each pinned candidate until one
+   accepts the account. This is *discovery*: an account belongs to exactly one
+   operator, and sending is what settles which.
+5. **Operator not determined, no pins** — `ReasonOperatorNotDetermined`.
+
+The catalogue is cached per client (`WithCatalogueTTL`, 6h by default), so
+verifying a pin is a local lookup and the common path costs one `SendTransfer`.
+
+**The context bounds the whole resolution**, not each call within it — a lookup,
+a catalogue fetch and several transfers all share it. Set your deadline there.
+
+#### When a pin stops being true
+
+`Pay` refuses to send rather than deliver an amount you did not ask for:
+
+```go
+if re, ok := dingconnect.IsResolutionError(err); ok {
+    switch re.Reason {
+    case dingconnect.ReasonPinSkuMissing:    // the pinned SKU is gone
+    case dingconnect.ReasonPinOutOfWindow:   // a commission rate moved
+    case dingconnect.ReasonCurrencyMismatch: // it now delivers another currency
+    case dingconnect.ReasonImpossibleAmount: // nothing lands in the window
+    }
+    // No money moved. re.Message names the window and what was available.
+}
+```
+
+A pin that still satisfies the window but is **no longer the cheapest** option is
+honoured silently. A pin overridden over pennies is not a pin.
+
+#### Recording what happened
+
+`Pay` returns a `Resolution` whether or not it succeeded, so a failed cascade
+still tells you what was tried:
+
+```go
+res, err := c.Pay(ctx, req)
+
+log.Printf("path=%s operator=%s sku=%s sent=%v delivered=%v",
+    res.Resolution.Path, res.Resolution.Operator, res.Resolution.SkuCode,
+    res.Resolution.SendValue, res.Resolution.Delivered)
+
+for _, a := range res.Resolution.Attempts { // discovery only
+    log.Printf("  %s ref=%s ok=%v codes=%v", a.SkuCode, a.DistributorRef, a.Completed, a.Codes)
+}
+```
+
+`Expected` is what the catalogue predicted and `Delivered` is what the transfer
+reported. A difference between them means the catalogue and the realised price
+disagree — worth alerting on, even though the money has already moved.
+
+This package deliberately owns no metrics client and no logger. It reports the
+facts; you record them.
+
 ### Errors
 
 DingConnect reports application errors in the body with HTTP 200, so the HTTP
@@ -170,6 +266,7 @@ if err != nil && !dingconnect.IsNearestMatch(err) {
 | `AccountLookup` | GetAccountLookup |
 | `EstimatePrices` | EstimatePrices |
 | `SendTransfer` | SendTransfer |
+| `Pay` | GetAccountLookup + GetProducts + SendTransfer |
 | `TransferRecords` | ListTransferRecords |
 | `CancelTransfers` | CancelTransfers |
 
@@ -184,7 +281,14 @@ Behaviour worth knowing, all verified against the live API:
   classify retryability by HTTP status.
 - **There is no sandbox.** Use `ValidateOnly` to exercise the transfer path.
 
-`CLAUDE.md` documents these in full, with the reasoning.
+Three things `Pay` depends on are **not** verified, and are documented as such:
+whether `RechargeNotAllowed` really signals a wrong-operator SKU, whether
+`DistributorRef` has a length limit (64 is assumed), and whether range products
+are priced linearly between their bounds. Each is designed so that being wrong
+degrades a fallback path rather than misdirecting money.
+
+`CLAUDE.md` documents all of this in full, with the reasoning and with how to
+confirm the unverified items.
 
 ## Testing
 

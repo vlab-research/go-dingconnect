@@ -28,6 +28,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -45,6 +46,13 @@ type Client struct {
 	apiKey  string
 	baseURL string
 	http    *http.Client
+
+	// Catalogue cache, used only by Pay. Held per Client because it is
+	// therefore per API key, and commission rates -- so what a SKU actually
+	// delivers -- are a property of the distributor account.
+	catalogueTTL time.Duration
+	cacheOnce    sync.Once
+	cache        *catalogueCache
 }
 
 // Option customises a Client.
@@ -65,9 +73,10 @@ func WithHTTPClient(h *http.Client) Option {
 // New returns a Client authenticating with the given API key.
 func New(apiKey string, opts ...Option) *Client {
 	c := &Client{
-		apiKey:  apiKey,
-		baseURL: DefaultBaseURL,
-		http:    &http.Client{Timeout: DefaultTimeout},
+		apiKey:       apiKey,
+		baseURL:      DefaultBaseURL,
+		http:         &http.Client{Timeout: DefaultTimeout},
+		catalogueTTL: DefaultCatalogueTTL,
 	}
 	for _, o := range opts {
 		o(c)
