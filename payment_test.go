@@ -146,7 +146,7 @@ func okTransfer(sku string, receive float64, currency string) stubResponse {
 			"TransferId": {"DistributorRef":"r","TransferRef":"DC1"},
 			"SkuCode": %q,
 			"Price": {"ReceiveValue": %v, "ReceiveCurrencyIso": %q, "SendCurrencyIso":"USD"},
-			"ProcessingState": "Completed"
+			"ProcessingState": "Complete"
 		},
 		"ResultCode": 1, "ErrorCodes": []
 	}`, sku, receive, currency)}

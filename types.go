@@ -1,5 +1,7 @@
 package dingconnect
 
+import "encoding/json"
+
 // All field names below mirror the wire format exactly. DingConnect uses
 // PascalCase everywhere, which happens to match Go's exported-field convention,
 // so most fields need no struct tag. Tags are written out anyway so that the
@@ -207,8 +209,16 @@ type TransferID struct {
 }
 
 // Processing states reported in TransferRecord.ProcessingState.
+//
+// StateCompleted is "Complete", not "Completed". The live API answers a
+// completed instant transfer with `"ProcessingState": "Complete"` (measured
+// 2026-09-07, TransferRefs 863784492, 863784561, 863784573); the earlier
+// spelling came from documentation and was never seen on the wire. With the
+// wrong constant every successful payment read as "not completed": Pay
+// returned no Transfer and dinersclub told the respondent it had failed after
+// the money had gone.
 const (
-	StateCompleted = "Completed"
+	StateCompleted = "Complete"
 	StateFailed    = "Failed"
 	StateSubmitted = "Submitted" // deferred transfers only; resolved via notification
 )
@@ -243,15 +253,32 @@ type SendTransferRequest struct {
 	SkuCode         string  `json:"SkuCode"`
 	SendValue       float64 `json:"SendValue"`
 	SendCurrencyIso string  `json:"SendCurrencyIso,omitempty"`
-	AccountNumber   string  `json:"AccountNumber"`
-	// DistributorRef is the caller's idempotency key. Reusing one is how a
-	// retry is made safe: DingConnect answers a replay with
-	// DuplicateTransactionPrevented instead of sending a second time.
+	// AccountNumber is the MSISDN in international format WITHOUT a leading
+	// "+": DingConnect refuses "+59172690398" with AccountNumberInvalid /
+	// AccountNumberFailedRegex and accepts "59172690398". Client.SendTransfer
+	// strips a leading "+" and surrounding whitespace so a caller may pass an
+	// E.164 string; see normalizeAccountNumber.
+	AccountNumber string `json:"AccountNumber"`
+	// DistributorRef is the caller's reference for the transfer. DingConnect's
+	// documentation calls it an idempotency key and this package used to say a
+	// replay answers DuplicateTransactionPrevented. Measured live 2026-09-07:
+	// a second SendTransfer with the same DistributorRef, one minute after a
+	// completed first, was ACCEPTED and PAID AGAIN (TransferRefs 863784492 and
+	// 863784573). Reuse the ref on retry anyway -- it is still the handle
+	// support asks for -- but do not rely on it to prevent a double payment.
 	DistributorRef string `json:"DistributorRef"`
 	// ValidateOnly runs the full validation and balance check without moving
 	// money. The response carries a TransferRecord whose ProcessingState
 	// reflects what would have happened.
-	ValidateOnly bool      `json:"ValidateOnly,omitempty"`
+	//
+	// ALWAYS SENT, never omitted. DingConnect requires the field to be present:
+	// a body without it is refused with ResultCode 4, ParameterInvalid, context
+	// "ValidateOnly". This field used to be `omitempty`, which dropped the
+	// false value that every real transfer sends, so every real transfer
+	// failed while every validate-only call succeeded. Measured live
+	// 2026-09-07: the same body with `"ValidateOnly": false` spelled out
+	// completed (TransferRef 863784492).
+	ValidateOnly bool      `json:"ValidateOnly"`
 	Settings     []Setting `json:"Settings,omitempty"`
 }
 
@@ -276,10 +303,53 @@ type TransferFilter struct {
 }
 
 // TransferRecords is a page of transfer history.
+//
+// On the wire each item is NOT a bare TransferRecord: ListTransferRecords
+// wraps every record in its own SendTransfer-shaped envelope,
+// `{"TransferRecord": {...}, "ResultCode": 1, "ErrorCodes": []}` (measured
+// 2026-09-07). Decoding the items as bare records silently produced a page
+// of empty structs, which made `dingconnect transfers` print blank rows and
+// looked like "no history". UnmarshalJSON unwraps the envelope so Items is
+// the flat list every caller expects.
 type TransferRecords struct {
 	Status
 	Items             []TransferRecord `json:"Items"`
 	ThereAreMoreItems bool             `json:"ThereAreMoreItems"`
+}
+
+// transferRecordEnvelope is one wire item of ListTransferRecords.
+type transferRecordEnvelope struct {
+	Status
+	TransferRecord *TransferRecord `json:"TransferRecord"`
+}
+
+// UnmarshalJSON accepts both the wrapped wire shape and a bare record per
+// item, so a fixture written either way decodes the same.
+func (t *TransferRecords) UnmarshalJSON(b []byte) error {
+	var raw struct {
+		Status
+		Items             []json.RawMessage `json:"Items"`
+		ThereAreMoreItems bool              `json:"ThereAreMoreItems"`
+	}
+	if err := json.Unmarshal(b, &raw); err != nil {
+		return err
+	}
+	t.Status = raw.Status
+	t.ThereAreMoreItems = raw.ThereAreMoreItems
+	t.Items = make([]TransferRecord, 0, len(raw.Items))
+	for _, item := range raw.Items {
+		var env transferRecordEnvelope
+		if err := json.Unmarshal(item, &env); err == nil && env.TransferRecord != nil {
+			t.Items = append(t.Items, *env.TransferRecord)
+			continue
+		}
+		var bare TransferRecord
+		if err := json.Unmarshal(item, &bare); err != nil {
+			return err
+		}
+		t.Items = append(t.Items, bare)
+	}
+	return nil
 }
 
 // CancelRequest asks for one transfer to be cancelled.

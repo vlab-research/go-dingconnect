@@ -3,6 +3,7 @@ package dingconnect
 import (
 	"context"
 	"net/http"
+	"strings"
 )
 
 // Every method here returns the decoded payload alongside a non-nil error when
@@ -145,11 +146,18 @@ func (c *Client) EstimatePrices(ctx context.Context, reqs []EstimateRequest) ([]
 
 // SendTransfer sends a top-up.
 //
-// This moves real money unless req.ValidateOnly is set. Two properties matter:
+// This moves real money unless req.ValidateOnly is set. Three properties
+// matter:
 //
-//   - DistributorRef is the idempotency key. Retrying with the same ref is
-//     safe; DingConnect answers a replay with DuplicateTransactionPrevented.
-//     Generating a fresh ref on retry risks sending twice.
+//   - AccountNumber is sent without a leading "+" whatever the caller passed:
+//     DingConnect's account regex rejects E.164's "+", and every phone that
+//     reaches this package from a survey form arrives in E.164. See
+//     normalizeAccountNumber.
+//   - DistributorRef is the caller's reference and is what support asks for.
+//     Reuse it on retry. It was documented here as an idempotency key that
+//     makes a replay answer DuplicateTransactionPrevented; a live replay on
+//     2026-09-07 was paid a second time instead. Do not rely on it to prevent
+//     a double payment.
 //   - The response carries a TransferRecord on failure as well as success, so
 //     the returned value is worth recording even when err is non-nil.
 //
@@ -157,7 +165,21 @@ func (c *Client) EstimatePrices(ctx context.Context, reqs []EstimateRequest) ([]
 // X-Option: DeferTransfer header, so a returned record is final rather than
 // pending an out-of-band notification.
 func (c *Client) SendTransfer(ctx context.Context, req SendTransferRequest) (SendTransferResponse, error) {
+	req.AccountNumber = normalizeAccountNumber(req.AccountNumber)
 	return do[SendTransferResponse](ctx, c, http.MethodPost, "/SendTransfer", nil, req)
+}
+
+// normalizeAccountNumber makes an account number acceptable to DingConnect's
+// regex: surrounding whitespace and a single leading "+" are removed, nothing
+// else. Measured live 2026-09-07: "+59172690398" fails with
+// AccountNumberInvalid / AccountNumberFailedRegex on both validate-only and
+// real sends; "59172690398" completes. Only the "+" is touched because it is
+// the one transformation whose meaning is certain -- E.164 to DingConnect's
+// bare international format -- and a caller's spaces or dashes are its own
+// bug to see, not ours to guess at.
+func normalizeAccountNumber(s string) string {
+	s = strings.TrimSpace(s)
+	return strings.TrimPrefix(s, "+")
 }
 
 // TransferRecords returns a page of transfer history.

@@ -144,10 +144,12 @@ func (e *Error) Has(code string) bool {
 // succeed until the account is funded. Whenever the body parsed, the body
 // decides.
 //
-// Retrying a SendTransfer is only safe because DistributorRef makes it
-// idempotent; DingConnect answers a replayed reference with
-// DuplicateTransactionPrevented rather than sending twice. Always reuse the
-// same DistributorRef on retry.
+// Always reuse the same DistributorRef on retry: it is the reference support
+// works from. Do NOT assume it prevents a double payment. This comment used to
+// say DingConnect answers a replayed reference with
+// DuplicateTransactionPrevented; a live replay on 2026-09-07 was paid a second
+// time (see SendTransferRequest.DistributorRef). A retry is only safe when the
+// first attempt is known not to have completed.
 func (e *Error) Retryable() bool {
 	if e.ResultCode != 0 {
 		return e.ResultCode == ResultCodeTransient ||

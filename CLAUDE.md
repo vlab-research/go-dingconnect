@@ -57,15 +57,40 @@ until the account is funded. `Error.Retryable` therefore consults the HTTP
 status **only** when no `ResultCode` was decoded. See
 `TestInsufficientBalanceIsNotRetryable`.
 
-### `DistributorRef` is the idempotency key
+### `DistributorRef` is NOT an idempotency key (measured 2026-09-07)
 
-DingConnect answers a replayed `DistributorRef` with
-`DuplicateTransactionPrevented` rather than sending twice. This is the only
-thing making a `SendTransfer` retry safe.
+This section used to say DingConnect answers a replayed `DistributorRef` with
+`DuplicateTransactionPrevented`. It does not, or not reliably: a second
+`SendTransfer` with the ref of a transfer that had completed one minute
+earlier was accepted and paid again (TransferRefs 863784492 and 863784573,
+Bs 11 each, same account). Nothing in this package makes a retry safe on its
+own; only the caller's knowledge that the first attempt did not complete does.
 
-**Always reuse the same ref when retrying.** Generating a fresh one on retry
-turns a transient failure into a double payment. The CLI refuses to invent a
-ref for this reason.
+**Still reuse the same ref when retrying.** It is the reference support works
+from and the handle `ListTransferRecords` searches by. The CLI refuses to
+invent a ref for that reason, not for idempotency.
+
+### Three wire facts that broke every real payment (measured 2026-09-07)
+
+All three passed every validate-only test and every unit test, because each
+only bites on a real send or on the real response. Each is now pinned by a
+test that carries the live evidence in its comment.
+
+- **`ValidateOnly` must be present on every `SendTransfer` body.** It was
+  `omitempty`, so a real send (false) carried no field and DingConnect refused
+  it: ResultCode 4, `ParameterInvalid`, context `ValidateOnly`. Validate-only
+  calls (true) were unaffected. `TestValidateOnlyAlwaysSent`.
+- **`AccountNumber` must not carry a leading `+`.** E.164 (`+59172690398`)
+  fails `AccountNumberInvalid / AccountNumberFailedRegex`; `59172690398`
+  completes. `SendTransfer` strips one leading `+` and nothing else.
+  `TestAccountNumberLeadingPlusStripped`.
+- **A completed transfer reports `ProcessingState: "Complete"`**, not
+  `"Completed"`. With the wrong constant `Pay` returned no `Transfer` for a
+  transfer that had paid. `StateCompleted` is now `"Complete"`.
+
+Also measured: `ListTransferRecords` wraps each item in a SendTransfer-style
+envelope (`{"TransferRecord": {...}, "ResultCode": 1, ...}`).
+`TransferRecords.UnmarshalJSON` unwraps it; `TestTransferRecordsUnwrapsEnvelope`.
 
 ### Unverified: what `RechargeNotAllowed` actually means
 
@@ -100,14 +125,10 @@ truncated ref is unsearchable in `ListTransferRecords`, which is exactly when
 you need it. Raising the constant is cheap once someone can ask DingConnect or
 watch a long ref be rejected.
 
-Related and also unverified: **whether a rejected transfer consumes its
-`DistributorRef`.** `Pay` derives a distinct ref per candidate specifically so
-this does not have to be known — if refs are not consumed the derived ones are
-merely more unique than they needed to be, whereas a single shared ref would
-make every discovery cascade fail at its second candidate with
-`DuplicateTransactionPrevented` if they are. To confirm: submit a transfer that
-fails without moving money (a deliberately invalid account number), then reuse
-that exact ref for a valid transfer and see whether it is refused.
+Related: whether a rejected transfer consumes its `DistributorRef` no longer
+matters, since even a *completed* transfer does not (see the DistributorRef
+section above). `Pay` still derives a distinct ref per candidate; the refs are
+merely more unique than they needed to be, and they stay searchable.
 
 ### Range products are assumed to be priced linearly
 

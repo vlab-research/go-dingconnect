@@ -606,17 +606,18 @@ func decideCascade(o outcome, hasNext bool) cascadeAction {
 	return actionReturn
 }
 
-// candidateRef derives a per-candidate idempotency key.
+// candidateRef derives a per-candidate reference.
 //
-// Deterministic, because that is the property everything else rests on: a retry
-// of the same candidate must produce the same ref or DingConnect's duplicate
-// protection is defeated and the account is paid twice.
+// Deterministic, so that a retry of the same candidate produces the same ref
+// and support can tie the attempts together.
 //
-// Whether a REJECTED transfer consumes its ref is UNVERIFIED against the live
-// API. Deriving is correct under either answer: if refs are not consumed the
-// derived ones are merely more unique than they needed to be, whereas a shared
-// ref would make every discovery cascade fail at its second candidate with
-// DuplicateTransactionPrevented if they are.
+// It was written as an idempotency key, on the assumption that DingConnect
+// answers a replayed ref with DuplicateTransactionPrevented. A live replay on
+// 2026-09-07 was paid a second time (see SendTransferRequest.DistributorRef),
+// so the ref does not protect against a double payment; only the caller's
+// knowledge that the first attempt did not complete does. Deriving per
+// candidate stays correct: the refs are merely more unique than they needed to
+// be.
 func candidateRef(base, sku string) (string, error) {
 	ref := base + "_" + sku
 	if len(ref) > MaxDistributorRefLen {

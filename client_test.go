@@ -260,9 +260,13 @@ func TestEstimatePricesSendsBareArray(t *testing.T) {
 	}
 }
 
-// TestValidateOnlyOmittedWhenFalse keeps the default request minimal; the field
-// is only meaningful when set.
-func TestValidateOnlyOmittedWhenFalse(t *testing.T) {
+// TestValidateOnlyAlwaysSent pins the opposite of what this test used to
+// assert. The field was `omitempty`, so a real send (ValidateOnly false)
+// carried no ValidateOnly at all, and DingConnect refuses such a body with
+// ResultCode 4 / ParameterInvalid / context "ValidateOnly". Validate-only
+// calls (true) were unaffected, which is why every test passed and every real
+// payment failed. Measured live 2026-09-07; see SendTransferRequest.
+func TestValidateOnlyAlwaysSent(t *testing.T) {
 	c, _, body := serve(t, jsonHandler(200,
 		`{"ResultCode":1,"ErrorCodes":[],"TransferRecord":{"ProcessingState":"Completed"}}`))
 
@@ -274,8 +278,40 @@ func TestValidateOnlyOmittedWhenFalse(t *testing.T) {
 	}
 	var sent map[string]any
 	json.Unmarshal(*body, &sent)
-	if _, ok := sent["ValidateOnly"]; ok {
-		t.Error("ValidateOnly must be omitted when false")
+	v, ok := sent["ValidateOnly"]
+	if !ok {
+		t.Fatal("ValidateOnly must be present on every SendTransfer body; DingConnect rejects its absence")
+	}
+	if v != false {
+		t.Errorf("ValidateOnly = %v, want false on a real send", v)
+	}
+}
+
+// TestAccountNumberLeadingPlusStripped: survey forms hand us E.164 ("+591..."),
+// DingConnect's account regex rejects the "+". Measured live 2026-09-07:
+// "+59172690398" -> AccountNumberInvalid / AccountNumberFailedRegex,
+// "59172690398" -> Complete.
+func TestAccountNumberLeadingPlusStripped(t *testing.T) {
+	c, _, body := serve(t, jsonHandler(200,
+		`{"ResultCode":1,"ErrorCodes":[],"TransferRecord":{"ProcessingState":"Completed"}}`))
+
+	_, err := c.SendTransfer(context.Background(), SendTransferRequest{
+		SkuCode: "X1", SendValue: 5, AccountNumber: " +59172690398 ", DistributorRef: "r1",
+	})
+	if err != nil {
+		t.Fatalf("SendTransfer: %v", err)
+	}
+	var sent map[string]any
+	json.Unmarshal(*body, &sent)
+	if sent["AccountNumber"] != "59172690398" {
+		t.Errorf("AccountNumber = %q, want %q", sent["AccountNumber"], "59172690398")
+	}
+	// Only a leading "+" and whitespace: anything else is the caller's to see.
+	if got := normalizeAccountNumber("59 17-26"); got != "59 17-26" {
+		t.Errorf("normalizeAccountNumber must not rewrite interior characters, got %q", got)
+	}
+	if got := normalizeAccountNumber("++591"); got != "+591" {
+		t.Errorf("only one leading + is removed, got %q", got)
 	}
 }
 
@@ -344,4 +380,30 @@ func keys(m map[string]any) []string {
 		out = append(out, k)
 	}
 	return out
+}
+
+// TestTransferRecordsUnwrapsEnvelope pins the real wire shape of
+// ListTransferRecords, captured live 2026-09-07: every item is wrapped in a
+// SendTransfer-style envelope. Decoding items as bare records gave a page of
+// empty structs and `dingconnect transfers` printed blank rows.
+func TestTransferRecordsUnwrapsEnvelope(t *testing.T) {
+	c, _, _ := serve(t, jsonHandler(200, `{"ResultCode":1,"ErrorCodes":[],"ThereAreMoreItems":false,"Items":[
+	  {"TransferRecord":{"TransferId":{"TransferRef":"863785357","DistributorRef":"lacbo_+59172690398_p1_t5"},
+	    "SkuCode":"BO_EN_TopUp","Price":{"ReceiveValue":11.0,"ReceiveCurrencyIso":"BOB","SendValue":1.15,"SendCurrencyIso":"USD"},
+	    "ProcessingState":"Complete","AccountNumber":"59172690398"},"ResultCode":1,"ErrorCodes":[]},
+	  {"TransferId":{"TransferRef":"bare","DistributorRef":"r2"},"SkuCode":"X","ProcessingState":"Complete"}
+	]}`))
+	res, err := c.TransferRecords(context.Background(), TransferFilter{Take: 5})
+	if err != nil {
+		t.Fatalf("TransferRecords: %v", err)
+	}
+	if len(res.Items) != 2 {
+		t.Fatalf("Items = %d, want 2", len(res.Items))
+	}
+	if res.Items[0].TransferId.TransferRef != "863785357" || res.Items[0].AccountNumber != "59172690398" || !res.Items[0].Completed() {
+		t.Errorf("wrapped item not unwrapped: %+v", res.Items[0])
+	}
+	if res.Items[1].TransferId.TransferRef != "bare" {
+		t.Errorf("bare item not accepted: %+v", res.Items[1])
+	}
 }

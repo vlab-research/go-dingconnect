@@ -82,10 +82,18 @@ dingconnect send --sku 2ANG44349 --value 12.08 --account 2348031234567 --ref ord
 dingconnect send --sku 2ANG44349 --value 12.08 --account 2348031234567 --ref order-123 --confirm
 ```
 
-`--ref` is the **idempotency key** and is required. Reuse the same value when
-retrying a failed transfer — DingConnect answers a replayed ref with
-`DuplicateTransactionPrevented` instead of sending twice. A fresh ref on retry
-risks paying twice.
+`--ref` is your reference for the transfer and is required. Reuse the same
+value when retrying a failed transfer; it is what DingConnect support works
+from. It is **not** a reliable idempotency key: this README used to say a
+replayed ref answers `DuplicateTransactionPrevented`, but a live replay on
+2026-09-07 was accepted and paid a second time. Only retry a transfer you know
+did not complete.
+
+Three wire facts, all measured live on 2026-09-07 and all pinned by tests:
+`ValidateOnly` must be present on every `SendTransfer` body (its absence is
+`ParameterInvalid`, context `ValidateOnly`); `AccountNumber` must not carry a
+leading `+` (the client strips one); and a completed transfer reports
+`ProcessingState` `"Complete"`, not `"Completed"`.
 
 ## Library
 
