@@ -113,6 +113,26 @@ TransferId, and `Product.UatNumber` supplies the known-good half. If the
 wrong-operator SKU comes back `RechargeNotAllowed`, this is settled — update
 this section and `decideCascade`'s comment together.
 
+### `AccountNumberInvalid` is also a wrong-operator answer (measured 2026-09-12)
+
+Discovery advances on `AccountNumberInvalid` too. Claro Honduras refuses every
+Tigo number with it: `GetAccountLookup` returns two Items for every Honduran
+number (`CLHN`+`S5HN` for a Claro range, `PQHN`+`TGHN` for a Tigo range, sharing
+the `^504([0-9]{8})$` regex), so detection is inconclusive, `CLHN` sorts first,
+and when the cascade stopped on this code no Tigo respondent in the LAC Healthy
+Diets study was ever paid.
+
+It cannot be told apart from a genuinely mistyped number, and it does not need
+to be. `hasNext` is false on every single-send path, so there a bad number
+returns exactly as before. On discovery a bad number costs one refused send per
+pin, moves no money, and fails with `AccountNumberInvalid` verbatim.
+`TestPayDiscoveryAdvancesPastAccountNumberInvalid`,
+`TestPayDiscoveryFailsANumberNoOperatorAccepts`.
+
+**Before a country goes live on pins**, check how many Items `GetAccountLookup`
+returns for its numbers. More than one means every payment there takes the
+discovery path.
+
 ### Unverified: `DistributorRef` length and charset
 
 `MaxDistributorRefLen` is **64, and that number is a guess.** DingConnect

@@ -140,6 +140,20 @@ func pinnedRequest() PayRequest {
 	}
 }
 
+// twoPinRequest pins two operators, and twoOperatorLookup is the ambiguous
+// GetAccountLookup answer for them. This is the shape of every Honduran number:
+// Claro and Tigo share one validation regex, so the lookup returns both and
+// only a send can tell them apart.
+func twoPinRequest() PayRequest {
+	req := pinnedRequest()
+	delete(req.Operators, "OPC")
+	return req
+}
+
+const twoOperatorLookup = `{"CountryIso":"AR","Items":[
+	{"ProviderCode":"OPA","SkuCodes":["SKU_A"]},
+	{"ProviderCode":"OPB","SkuCodes":["SKU_B"]}],"ResultCode":1,"ErrorCodes":[]}`
+
 func okTransfer(sku string, receive float64, currency string) stubResponse {
 	return stubResponse{200, fmt.Sprintf(`{
 		"TransferRecord": {
@@ -594,6 +608,60 @@ func TestPayDiscoveryAdvancesOnRechargeNotAllowed(t *testing.T) {
 	}
 }
 
+// TestPayDiscoveryAdvancesPastAccountNumberInvalid: an operator refuses a
+// number that is not its own with AccountNumberInvalid, not only with
+// RechargeNotAllowed (Claro Honduras does, for every Tigo number). Stopping on
+// it means the number's real operator is never tried.
+func TestPayDiscoveryAdvancesPastAccountNumberInvalid(t *testing.T) {
+	api := newPayAPI()
+	api.products = threeOperatorCatalogue()
+	api.lookup = twoOperatorLookup
+	api.transfers["SKU_A"] = errTransfer(CodeAccountNumberInvalid)
+	api.transfers["SKU_B"] = okTransfer("SKU_B", 1000, "ARS")
+
+	res, err := api.client(t).Pay(context.Background(), twoPinRequest())
+	if err != nil {
+		t.Fatalf("Pay: %v -- the cascade stopped before trying the second operator", err)
+	}
+	if got := api.sentSkus(); !eqStrings(got, []string{"SKU_A", "SKU_B"}) {
+		t.Errorf("sent %v, want [SKU_A SKU_B]", got)
+	}
+	if res.Resolution.Path != PathDiscovery {
+		t.Errorf("Path = %q, want %q", res.Resolution.Path, PathDiscovery)
+	}
+	if res.Transfer == nil || res.Resolution.SkuCode != "SKU_B" {
+		t.Errorf("Transfer = %v, SkuCode = %q; want a completed transfer on SKU_B",
+			res.Transfer, res.Resolution.SkuCode)
+	}
+	if len(res.Resolution.Attempts) != 2 {
+		t.Fatalf("Attempts = %d, want 2 recorded outcomes", len(res.Resolution.Attempts))
+	}
+	if got := res.Resolution.Attempts[0].Codes; len(got) != 1 || got[0] != CodeAccountNumberInvalid {
+		t.Errorf("Attempts[0].Codes = %v, want [%s]", got, CodeAccountNumberInvalid)
+	}
+}
+
+// TestPayDiscoveryFailsANumberNoOperatorAccepts: advancing on
+// AccountNumberInvalid must not disguise a genuinely bad number. Every pin is
+// tried once, nothing completes, and the code reaches the caller verbatim.
+func TestPayDiscoveryFailsANumberNoOperatorAccepts(t *testing.T) {
+	api := newPayAPI()
+	api.products = threeOperatorCatalogue()
+	api.lookup = twoOperatorLookup
+	api.fallback = &stubResponse{200, errTransfer(CodeAccountNumberInvalid).body}
+
+	res, err := api.client(t).Pay(context.Background(), twoPinRequest())
+	if !HasCode(err, CodeAccountNumberInvalid) {
+		t.Fatalf("err = %v, want it to carry %s", err, CodeAccountNumberInvalid)
+	}
+	if res.Transfer != nil {
+		t.Error("no transfer should have completed")
+	}
+	if got := api.sentSkus(); !eqStrings(got, []string{"SKU_A", "SKU_B"}) {
+		t.Errorf("sent %v, want each pin tried exactly once: [SKU_A SKU_B]", got)
+	}
+}
+
 // TestPayDiscoveryDerivesADeterministicRefPerCandidate. Whether a rejected
 // transfer consumes its ref is unverified; deriving is correct either way, and
 // determinism is what keeps a retry from paying twice.
@@ -636,7 +704,6 @@ func TestPayDiscoveryStopConditions(t *testing.T) {
 		code string
 	}{
 		{"RateLimited may be a per-account rule, never advance", CodeRateLimited},
-		{"AccountNumberInvalid: no other product can help", CodeAccountNumberInvalid},
 		{"an unrecognised code stops, because advance is an allow-list", "SomethingIntroducedTomorrow"},
 		{"InsufficientBalance stops", CodeInsufficientBalance},
 		{"AuthenticationFailed stops", CodeAuthenticationFailed},
@@ -793,14 +860,16 @@ func TestDecideCascade(t *testing.T) {
 		{"fault returns", outcome{fault: true}, true, actionReturn},
 		{"RechargeNotAllowed advances", outcome{codes: []string{CodeRechargeNotAllowed}}, true, actionAdvance},
 		{"RechargeNotAllowed returns when last", outcome{codes: []string{CodeRechargeNotAllowed}}, false, actionReturn},
-		{"AccountNumberInvalid returns", outcome{codes: []string{CodeAccountNumberInvalid}}, true, actionReturn},
+		{"AccountNumberInvalid advances", outcome{codes: []string{CodeAccountNumberInvalid}}, true, actionAdvance},
+		{"AccountNumberInvalid returns when last", outcome{codes: []string{CodeAccountNumberInvalid}}, false, actionReturn},
 		{"RateLimited returns", outcome{codes: []string{CodeRateLimited}}, true, actionReturn},
 
 		// A stop code anywhere in the array wins. Reading Codes[0] would
 		// advance past a rate limit in the second of these.
 		{"RateLimited first", outcome{codes: []string{CodeRateLimited, CodeRechargeNotAllowed}}, true, actionReturn},
 		{"RateLimited second", outcome{codes: []string{CodeRechargeNotAllowed, CodeRateLimited}}, true, actionReturn},
-		{"AccountNumberInvalid second", outcome{codes: []string{CodeRechargeNotAllowed, CodeAccountNumberInvalid}}, true, actionReturn},
+		{"RateLimited alongside AccountNumberInvalid", outcome{codes: []string{CodeAccountNumberInvalid, CodeRateLimited}}, true, actionReturn},
+		{"AccountNumberInvalid second", outcome{codes: []string{CodeRechargeNotAllowed, CodeAccountNumberInvalid}}, true, actionAdvance},
 
 		{"unrecognised returns", outcome{codes: []string{"BrandNewCode"}}, true, actionReturn},
 		{"unrecognised alongside RechargeNotAllowed still advances",
@@ -815,14 +884,15 @@ func TestDecideCascade(t *testing.T) {
 	}
 }
 
-// TestOnlyRechargeNotAllowedEverAdvances states the safety property directly
-// rather than sampling it: over every code this package defines, exactly one
-// may cause another send.
+// TestOnlyWrongOperatorCodesEverAdvance states the safety property directly
+// rather than sampling it: over every code this package defines, exactly two
+// may cause another send -- the two an operator uses to refuse a number that
+// is not its own.
 //
 // A table can drift by omission. This cannot: adding a code to errors.go and
 // forgetting to consider it leaves this passing only because the default is
 // stop, which IS the guarantee.
-func TestOnlyRechargeNotAllowedEverAdvances(t *testing.T) {
+func TestOnlyWrongOperatorCodesEverAdvance(t *testing.T) {
 	every := []string{
 		CodeNearestMatch, CodeTransientProviderError, CodeProviderError,
 		CodeRechargeNotAllowed, CodeRateLimited, CodeInsufficientBalance,
@@ -835,7 +905,7 @@ func TestOnlyRechargeNotAllowedEverAdvances(t *testing.T) {
 	for _, code := range every {
 		got := decideCascade(outcome{codes: []string{code}}, true)
 		want := actionReturn
-		if code == CodeRechargeNotAllowed {
+		if code == CodeRechargeNotAllowed || code == CodeAccountNumberInvalid {
 			want = actionAdvance
 		}
 		if got != want {

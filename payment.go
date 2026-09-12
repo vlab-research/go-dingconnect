@@ -463,8 +463,8 @@ func (c *Client) sendCandidates(ctx context.Context, req PayRequest, candidates 
 	}
 
 	// Exhausted. Return the LAST REAL FAILURE rather than a synthesised one:
-	// the final RechargeNotAllowed is the honest answer, namely that no pinned
-	// product accepted this account.
+	// the final refusal is the honest answer, namely that no pinned product
+	// accepted this account.
 	return PayResult{Response: lastResp, Resolution: res}, lastErr
 }
 
@@ -577,8 +577,7 @@ func decideCascade(o outcome, hasNext bool) cascadeAction {
 	}
 
 	for _, c := range o.codes {
-		switch c {
-		case CodeRateLimited:
+		if c == CodeRateLimited {
 			// NEVER advanced past. DingConnect returns RateLimited both for
 			// genuine transport throttling and for a per-account rule being
 			// breached, and the response does not distinguish them. Sending
@@ -591,14 +590,15 @@ func decideCascade(o outcome, hasNext bool) cascadeAction {
 			// request after a wait is fine; advancing to a new product now is
 			// not.
 			return actionReturn
-		case CodeAccountNumberInvalid:
-			// The account number itself is bad. No other product can help.
-			return actionReturn
 		}
 	}
 
+	// Operators refuse a number that is not their own with either code: Claro
+	// Honduras answers every Tigo number AccountNumberInvalid. hasNext is false
+	// on every single-send path, so a genuinely bad number still returns there,
+	// and on discovery it fails only after every pin has refused it.
 	for _, c := range o.codes {
-		if c == CodeRechargeNotAllowed && hasNext {
+		if (c == CodeRechargeNotAllowed || c == CodeAccountNumberInvalid) && hasNext {
 			return actionAdvance
 		}
 	}
